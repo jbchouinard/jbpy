@@ -1,0 +1,8 @@
+__pycache__
+*.pyo
+*.pyc
+.direnv
+*.gif
+*.png
+*.mp4
+.DS_Store
