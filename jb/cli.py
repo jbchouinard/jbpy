@@ -28,7 +28,7 @@ class CLI:
         def decorator(func):
             name = func.__name__.replace("_", "-")
             subparser = self.subparsers.add_parser(name, *args, **kwargs)
-            for arg_args, arg_kwargs in self.arguments[name]:
+            for arg_args, arg_kwargs in self.arguments[name][::-1]:
                 subparser.add_argument(*arg_args, **arg_kwargs)
 
             command = Command(name, func, self.parser, subparser)
@@ -47,7 +47,8 @@ class CLI:
 
     def __call__(self):
         args = self.parser.parse_args()
-        self.commands[args.command](**vars(args))
+        params = {k.replace("-", "_"): v for k, v in vars(args).items()}
+        self.commands[args.command](**params)
 
 
 def get_input(prompt, vdef: Optional[str] = None, vtype: Callable[[str], T] = str) -> T:

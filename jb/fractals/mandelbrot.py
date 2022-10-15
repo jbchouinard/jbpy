@@ -1,126 +1,47 @@
-import math
+import pathlib
+import pickle
 import time
-from typing import NamedTuple
+from typing import List
 
 import numpy as np
 from PIL import Image
 
-from jb.cli import CLI, get_input
-from jb.color import Color, BandColorGradient, SmoothColorGradient
+from jb.cli import CLI
+from jb.color import Color, GRADIENT_MODES, PALETTES, make_gradient
+from jb.math.coord import Axis, Grid, Point, Window
 
 
-WHITE = Color.from_hex("#ffffff")
-BLACK = Color.from_hex("#000000")
-PALETTES = {
-    "bw": [BLACK, WHITE],
-    "colorful": [
-        Color.from_hex("#003f5c"),
-        Color.from_hex("#2f4b7c"),
-        Color.from_hex("#665191"),
-        Color.from_hex("#a05195"),
-        Color.from_hex("#d45087"),
-        Color.from_hex("#f95d6a"),
-        Color.from_hex("#ff7c43"),
-        Color.from_hex("#ffa600"),
-    ],
-}
-COLOR_MODES = {"band": BandColorGradient, "smooth": SmoothColorGradient}
-
-
-class Point(NamedTuple):
-    x: float
-    y: float
-
-    def to_complex(self) -> complex:
-        return self.x + self.y * 1j
-
-    @classmethod
-    def from_complex(cls, c: complex) -> "Point":
-        return cls(c.real, c.imag)
-
-
-class Axis(NamedTuple):
-    minv: float
-    maxv: float
-
-    @property
-    def length(self) -> float:
-        return self.maxv - self.minv
-
-    def bound(self, v):
-        return max(self.minv, min(self.maxv, v))
-
-    def project_to(self, other: "Axis", v: float) -> float:
-        frac = (self.bound(v) - self.minv) / self.length
-        return other.minv + frac * other.length
-
-    def __str__(self):
-        return f"{self.minv}-{self.maxv}"
-
-
-class Grid(NamedTuple):
-    axis_x: Axis
-    axis_y: Axis
-
-    def bound(self, p: Point) -> "Point":
-        return Point(x=self.axis_x.bound(p.x), y=self.axis_y.bound(p.y))
-
-    def project_to(self, other: "Grid", p: Point) -> Point:
-        x = self.axis_x.project_to(other.axis_x, p.x)
-        y = self.axis_y.project_to(other.axis_y, p.y)
-        return Point(x, y)
-
-    @property
-    def yx_ratio(self) -> float:
-        return self.axis_y.length / self.axis_x.length
-
-    def __str__(self):
-        return f"{self.axis_x},{self.axis_y}"
-
-    @classmethod
-    def from_str(cls, s: str) -> "Grid":
-        parts = s.split(",")
-        assert len(parts) == 4, "expected 4 values"
-        parts = [float(x) for x in parts]
-        return cls(Axis(*parts[:2]), Axis(*parts[2:]))
-
-
-class Window(NamedTuple):
-    position: Point
-    height: float
-    width: float
-
-    def to_grid(self) -> Grid:
-        min_x = self.position.x - self.width / 2.0
-        max_x = self.position.x + self.width / 2.0
-        min_y = self.position.y - self.height / 2.0
-        max_y = self.position.y + self.height / 2.0
-        return Grid(Axis(min_x, max_x), Axis(min_y, max_y))
+INT16_MAX = np.iinfo(np.int16).max
 
 
 def generate_complex_coordinates(width: int, height: int, axes: Grid) -> np.ndarray:
-    pixel_box = Grid(Axis(0, width), Axis(0, height))
-    arr = np.zeros((width, height), complex)
+    x_start = axes.axis_x.minv
+    x_scale = axes.axis_x.length / width
+    x_axis = [x_start + (x + 0.5) * x_scale for x in range(width)]
+    x_pixels = np.array([x_axis])
 
-    for x in range(width):
-        for y in range(height):
-            p = Point(x + 0.5, y + 0.5)
-            pa = pixel_box.project_to(axes, p)
-            arr[x][y] = pa.to_complex()
+    y_start = axes.axis_y.minv
+    y_scale = axes.axis_y.length / height
+    y_axis = [y_start + (y + 0.5) * y_scale for y in range(height)]
+    y_pixels = np.array([y_axis])
 
-    return arr
+    c_grid = 1j * y_pixels + x_pixels.T
+    return c_grid
 
 
 def i_values_colorizer(max_iterations: int, color_mode: str, palette: str):
-    gradient = COLOR_MODES[color_mode](max_iterations, *PALETTES[palette])
-    colors = {-1: Color(0, 0, 0)}
+    gradient = make_gradient(max_iterations, palette, color_mode)
+
+    colors = {INT16_MAX: Color(0, 0, 0)}
     for i_val in range(max_iterations + 1):
         colors[i_val] = gradient.get(i_val)
 
-    def color_i_value(i_value, arr):
-        arr[0], arr[1], arr[2] = colors[i_value]
+    get_color_vec = np.vectorize(colors.__getitem__)
 
-    return color_i_value
+    def color_i_values(i_values):
+        return np.dstack(get_color_vec(i_values)).astype("uint8")
+
+    return color_i_values
 
 
 class MandelbrotSet:
@@ -129,37 +50,34 @@ class MandelbrotSet:
         self.treshold = treshold
         self.c_values = np.copy(c_values)
         self.z_values = np.copy(c_values)
-        self.i_values = np.full(c_values.shape, -1)
+        self.i_values = np.full(c_values.shape, INT16_MAX, dtype="int16")
 
-    def iterate(self):
-        self.z_values = self.z_values * self.z_values + self.c_values
+    def _iterate(self):
+        np.square(self.z_values, out=self.z_values)
+        np.add(self.z_values, self.c_values, out=self.z_values)
         self.iteration += 1
 
-        def update_i_values(i_value, z_value):
-            if i_value != -1:
-                return i_value
-            assert not math.isnan(abs(z_value)), "oops, nan"
-            if abs(z_value) > self.treshold:
-                return self.iteration
-            else:
-                return -1
+    def _update_i_values(self):
+        magnitudes = np.absolute(self.z_values)
+        blown_up = np.greater(magnitudes, self.treshold)
+        new_i_values = blown_up * self.iteration + np.logical_not(blown_up) * INT16_MAX
+        self.i_values = np.minimum(self.i_values, new_i_values)
 
-        self.i_values = np.vectorize(update_i_values)(self.i_values, self.z_values)
-
-    def iterate_n(self, n: int):
+    def iterate(self, n: int = 1, update_i_values_period: int = 1):
         for _ in range(n):
-            self.iterate()
+            self._iterate()
+            if (self.iteration % update_i_values_period) == 0:
+                self._update_i_values()
+
+    def copy_i_values(self):
+        return np.copy(self.i_values)
+
+    @staticmethod
+    def i_values_to_image(i_values, colorizer):
+        return Image.fromarray(colorizer(i_values.T), mode="RGB")
 
     def to_image(self, colorizer):
-        width, height = self.i_values.shape
-        colors = np.zeros((height, width, 3), dtype="uint8")
-
-        for y in range(height):
-            for x in range(width):
-                colorizer(self.i_values[x][y], colors[y][x])
-
-        img = Image.fromarray(colors.astype("uint8"), mode="RGB")
-        return img
+        return self.i_values_to_image(self.i_values, colorizer)
 
 
 cli = CLI()
@@ -168,64 +86,247 @@ cli = CLI()
 @cli.command()
 @cli.argument("-s", "--size", type=int, default=500)
 @cli.argument("-c", "--color", choices=PALETTES.keys(), default="colorful")
-@cli.argument("-m", "--mode", choices=COLOR_MODES.keys(), default="band")
+@cli.argument("-m", "--mode", choices=GRADIENT_MODES.keys(), default="band")
 def test_color(size, color, mode):
-    pixels = np.zeros((size, size, 3), np.uint8)
-    colorizer = i_values_colorizer(size, mode, color)
-    for y in range(size):
-        for x in range(size):
-            colorizer(x, pixels[y][x])
+    i_values = np.zeros((size, size), dtype=np.int16)
+    with np.nditer(i_values, flags=["multi_index"], op_flags=["readwrite"]) as it:
+        for i_val in it:
+            x, _ = it.multi_index
+            i_val[...] = x
 
+    colorizer = i_values_colorizer(size, mode, color)
+    pixels = colorizer(i_values.T)
     img = Image.fromarray(pixels, mode="RGB")
     img.show()
 
 
+def generate_viewer_image(width, height, axes: Grid, iterations, colorizer):
+    grid = generate_complex_coordinates(width, height, axes)
+    mandelbrot = MandelbrotSet(grid)
+    mandelbrot.iterate(iterations, 5)
+    return mandelbrot.to_image(colorizer)
+
+
 @cli.command()
-@cli.argument("y2", type=float)
-@cli.argument("y1", type=float)
-@cli.argument("x2", type=float)
-@cli.argument("x1", type=float)
+@cli.argument("location", type=float, nargs=4)
 @cli.argument("-p", "--pixels", type=int, default=1000)
 @cli.argument("-n", "--iterations", type=int, default=200)
-@cli.argument("-m", "--mode", choices=COLOR_MODES.keys(), default="band")
-@cli.argument("-c", "--color", choices=PALETTES.keys(), default="colorful")
+@cli.argument("-m", "--mode", choices=GRADIENT_MODES.keys(), default="smooth")
+@cli.argument("-c", "--color", choices=PALETTES.keys(), default="rainbow")
+@cli.argument("-o", "--output-png", type=str)
 def viewer(
-    x1: float,
-    x2: float,
-    y1: float,
-    y2: float,
+    location: List[float],
+    pixels: int,
+    iterations: int,
+    mode: str,
+    color: str,
+    output_png: str,
+):
+    axes = Grid.from_floats(*location)
+    width = pixels
+    height = round(pixels * axes.yx_ratio)
+    colorizer = i_values_colorizer(iterations, mode, color)
+
+    img = generate_viewer_image(width, height, axes, iterations, colorizer)
+    if output_png:
+        img.save(output_png)
+    img.show()
+
+
+def loop_frames(frames, freeze=10):
+    return [frames[0]] * freeze + frames[1:-1] + [frames[-1]] * freeze + frames[-1:1:-1]
+
+
+@cli.command()
+@cli.argument("-p", "--pixels", type=int, default=1000)
+@cli.argument("-n", "--iterations", type=int, default=200)
+@cli.argument("-m", "--mode", choices=GRADIENT_MODES.keys(), default="smooth")
+@cli.argument("-c", "--color", choices=PALETTES.keys(), default="rainbow")
+def explorer(pixels, iterations, mode, color):
+    import readline
+    import webbrowser
+
+    selection_grid = Grid.from_floats(0, 100, 0, 100)
+    colorizer = i_values_colorizer(iterations, mode, color)
+
+    location = Grid.from_floats(-2.0, 1.0, -1.5, 1.5)
+    history = [location]
+
+    def saveloc(name):
+        with open(f"location_{name}.pickle", "wb") as f:
+            pickle.dump(location, f)
+
+    def loadloc(name):
+        nonlocal location
+        with open(f"location_{name}.pickle", "rb") as f:
+            loaded = pickle.load(f)
+        assert type(loaded) is Grid
+        location = loaded
+        redraw()
+
+    def redraw():
+        img = generate_viewer_image(pixels, pixels, location, iterations, colorizer)
+        img.save("explorer.png")
+        webbrowser.open(f"file://{pathlib.Path('explorer.png').resolve()}")
+
+    def move(x, y):
+        x = int(x)
+        y = int(y)
+        new_center = selection_grid.project_to(location, Point(x, y))
+        old_window = location.to_window()
+        new_window = Window(new_center, old_window.height, old_window.width)
+        return new_window.to_grid()
+
+    def zoom(factor):
+        factor = float(factor)
+        window = location.to_window()
+        zoomed = Window(
+            position=window.position,
+            height=window.height / factor,
+            width=window.width / factor,
+        )
+        return zoomed.to_grid()
+
+    def update(newloc):
+        nonlocal location
+        history.append(location)
+        location = newloc
+        redraw()
+
+    def make_gif(duration, fps, output_file):
+        duration = int(duration)
+        fps = int(fps)
+        output_file = str(output_file)
+        gif_zoom(
+            output_gif=output_file,
+            duration=duration,
+            fps=fps,
+            start=[-2.0, 1.0, -1.5, 1.5],
+            end=[
+                location.axis_x.minv,
+                location.axis_x.maxv,
+                location.axis_y.minv,
+                location.axis_y.maxv,
+            ],
+            pixels=pixels,
+            iterations=iterations,
+            color=color,
+            mode=mode,
+        )
+
+    def command():
+        nonlocal location
+        nonlocal history
+
+        command, *args = input("m> ").strip().split(" ")
+
+        if command == "undo":
+            if history:
+                location = history.pop()
+                redraw()
+        elif command == "move":
+            update(move(*args))
+            redraw()
+        elif command == "zoom":
+            update(zoom(*args))
+            redraw()
+        elif command == "loc":
+            print(location)
+        elif command == "saveloc":
+            saveloc(*args)
+        elif command == "loadloc":
+            loadloc(*args)
+        elif command == "gif":
+            make_gif(*args)
+        else:
+            print("unknown command")
+
+    redraw()
+    while True:
+        try:
+            command()
+        except Exception as exc:
+            print(exc)
+
+
+@cli.command()
+@cli.argument("output-gif", type=str)
+@cli.argument("duration", type=int)
+@cli.argument("fps", type=int)
+@cli.argument("start", type=float, nargs=4)
+@cli.argument("end", type=float, nargs=4)
+@cli.argument("-p", "--pixels", type=int, default=1200)
+@cli.argument("-n", "--iterations", type=int, default=200)
+@cli.argument("-m", "--mode", choices=GRADIENT_MODES.keys(), default="smooth")
+@cli.argument("-c", "--color", choices=PALETTES.keys(), default="rainbow")
+def gif_zoom(
+    output_gif: str,
+    duration: int,
+    fps: int,
+    start: List[float],
+    end: List[float],
     pixels: int,
     iterations: int,
     mode: str,
     color: str,
 ):
-    axes = Grid(Axis(x1, x2), Axis(y1, y2))
+    axes_start = Grid.from_floats(*start)
+    axes_end = Grid.from_floats(*end)
     width = pixels
-    height = round(pixels * axes.yx_ratio)
-    grid = generate_complex_coordinates(width, height, axes)
-
-    mandelbrot = MandelbrotSet(grid)
-    mandelbrot.iterate_n(iterations)
+    height = round(pixels * axes_start.yx_ratio)
 
     colorizer = i_values_colorizer(iterations, mode, color)
-    img = mandelbrot.to_image(colorizer)
-    img.show()
+    frame_count = duration * fps
+    frames = []
+
+    for frame_n in range(frame_count + 1):
+        start_t = time.time()
+        frac = frame_n / frame_count
+        print(frac)
+        axes = axes_start.interpolate_geometric(axes_end, frame_n / frame_count)
+        print(axes)
+        grid = generate_complex_coordinates(
+            width,
+            height,
+            axes,
+        )
+        mandelbrot = MandelbrotSet(grid)
+        mandelbrot.iterate(iterations, 5)
+        frames.append(mandelbrot.to_image(colorizer))
+        print(f"generated frame {frame_n} in {time.time() - start_t:.2f} seconds")
+
+    frames = loop_frames(frames, freeze=fps)
+
+    frames[0].save(
+        output_gif,
+        save_all=True,
+        append_images=frames[1:],
+        duration=1000 / fps,
+        loop=0,
+    )
+    print(f"GIF saved to file://{output_gif}")
 
 
 @cli.command()
-@cli.argument("-m", "--mode", choices=COLOR_MODES.keys(), default="band")
-@cli.argument("-c", "--color", choices=PALETTES.keys(), default="colorful")
-def gif_iterations(mode: str, color: str):
-    axes = get_input("axes", "-2.0 1.0 -1.33333 1.33333", Grid.from_str)
-    width = get_input("width", "1080", int)
-    height = get_input(
-        "height", str(round(width * axes.axis_y.length / axes.axis_x.length)), int
-    )
-
-    iterations = get_input("iterations", "100", int)
-    duration = get_input("duration", "5", int)
-    output_file = get_input("output file", "mandelbrot-iter.gif", str)
-
+@cli.argument("output-gif", type=str)
+@cli.argument("--location", type=float, nargs=4, default=[-2.0, 0.6, -1.2, 1.2])
+@cli.argument("-p", "--pixels", type=int, default=2600)
+@cli.argument("-n", "--iterations", type=int, default=100)
+@cli.argument("-d", "--duration", type=int, default=10)
+@cli.argument("-m", "--mode", choices=GRADIENT_MODES.keys(), default="smooth")
+@cli.argument("-c", "--color", choices=PALETTES.keys(), default="rainbow")
+def gif_iterations(
+    output_gif: str,
+    location: List[float],
+    pixels: int,
+    iterations: int,
+    duration: int,
+    mode: str,
+    color: str,
+):
+    axes = Grid.from_floats(*location)
+    width = pixels
+    height = round(pixels * axes.yx_ratio)
     grid = generate_complex_coordinates(width, height, axes)
     colorizer = i_values_colorizer(iterations, mode, color)
     mandelbrot = MandelbrotSet(grid)
@@ -237,15 +338,18 @@ def gif_iterations(mode: str, color: str):
         frames.append(mandelbrot.to_image(colorizer))
         print(f"generated frame {i} in {time.time() - start:.2f} seconds")
 
+    frames = loop_frames(frames, freeze=10)
+
     frames[0].save(
-        output_file,
+        output_gif,
         save_all=True,
         append_images=frames[1:],
         duration=(1000 * duration) // iterations,
         loop=0,
     )
-    print(f"GIF saved to file://{output_file}")
+    print(f"GIF saved to file://{output_gif}")
 
 
 if __name__ == "__main__":
+    np.seterr(all="ignore")
     cli()
