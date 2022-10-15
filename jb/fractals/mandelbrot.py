@@ -2,6 +2,7 @@ import pathlib
 import pickle
 import time
 from typing import List
+import webbrowser
 
 import numpy as np
 from PIL import Image
@@ -113,7 +114,7 @@ def generate_viewer_image(width, height, axes: Grid, iterations, colorizer):
 @cli.argument("-n", "--iterations", type=int, default=200)
 @cli.argument("-m", "--mode", choices=GRADIENT_MODES.keys(), default="smooth")
 @cli.argument("-c", "--color", choices=PALETTES.keys(), default="rainbow")
-@cli.argument("-o", "--output-png", type=str)
+@cli.argument("-o", "--output-png", type=str, default="viewer.png")
 def viewer(
     location: List[float],
     pixels: int,
@@ -128,9 +129,8 @@ def viewer(
     colorizer = i_values_colorizer(iterations, mode, color)
 
     img = generate_viewer_image(width, height, axes, iterations, colorizer)
-    if output_png:
-        img.save(output_png)
-    img.show()
+    img.save(output_png)
+    webbrowser.open(output_png)
 
 
 def loop_frames(frames, freeze=10):
@@ -350,6 +350,10 @@ def gif_iterations(
     print(f"GIF saved to file://{output_gif}")
 
 
-if __name__ == "__main__":
+def main():
     np.seterr(all="ignore")
     cli()
+
+
+if __name__ == "__main__":
+    main()
